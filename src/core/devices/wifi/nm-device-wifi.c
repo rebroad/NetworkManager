@@ -2709,21 +2709,27 @@ supplicant_iface_notify_current_bss(NMSupplicantInterface *iface,
                 nm_clear_g_source_inst(&priv->roam_supplicant_wait_source);
                 req = nm_device_get_act_request(NM_DEVICE(self));
                 if (req) {
-                    NMConnection *connection = nm_active_connection_get_connection(NM_ACTIVE_CONNECTION(req));
+                    NMConnection *connection = nm_act_request_get_applied_connection(req);
                     if (connection) {
                         NMSettingWireless *s_wifi = nm_connection_get_setting_wireless(connection);
                         if (s_wifi) {
-                            GBytes *bssid_bytes = nm_setting_wireless_get_bssid(s_wifi);
-                            if (bssid_bytes) {
-                                const guint8 *bssid_data = g_bytes_get_data(bssid_bytes, NULL);
+                            const char *bssid_str = nm_setting_wireless_get_bssid(s_wifi);
+                            if (bssid_str) {
                                 NMEtherAddr bssid_addr;
-                                memcpy(&bssid_addr, bssid_data, ETH_ALEN);
-                                NMEtherAddr *new_ap_bssid = nm_wifi_ap_get_bssid(new_ap);
-                                if (new_ap_bssid && !nm_ether_addr_equal(&bssid_addr, new_ap_bssid)) {
-                                    _LOGD(LOGD_WIFI, "Ignoring roam to %s because connection is restricted to %s",
-                                          nm_ether_addr_to_string(new_ap_bssid),
-                                          nm_ether_addr_to_string(&bssid_addr));
-                                    return;
+                                const char *new_ap_address;
+                                NMEtherAddr new_ap_bssid;
+                                if (nm_ether_addr_from_string(&bssid_addr, bssid_str)) {
+                                    new_ap_address = nm_wifi_ap_get_address(new_ap);
+                                    if (new_ap_address) {
+                                        if (nm_ether_addr_from_string(&new_ap_bssid, new_ap_address)) {
+                                            if (!nm_ether_addr_equal(&bssid_addr, &new_ap_bssid)) {
+                                                _LOGD(LOGD_WIFI, "Ignoring roam to %s because connection is restricted to %s",
+                                                      new_ap_address,
+                                                      bssid_str);
+                                                return;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

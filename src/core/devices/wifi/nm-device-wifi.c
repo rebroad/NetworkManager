@@ -2707,6 +2707,29 @@ supplicant_iface_notify_current_bss(NMSupplicantInterface *iface,
                  * and the client will fall back to a DISCOVER, potentially
                  * getting a different address. */
                 nm_clear_g_source_inst(&priv->roam_supplicant_wait_source);
+                req = nm_device_get_act_request(NM_DEVICE(self));
+                if (req) {
+                    NMConnection *connection = nm_active_connection_get_connection(NM_ACTIVE_CONNECTION(req));
+                    if (connection) {
+                        NMSettingWireless *s_wifi = nm_connection_get_setting_wireless(connection);
+                        if (s_wifi) {
+                            GBytes *bssid_bytes = nm_setting_wireless_get_bssid(s_wifi);
+                            if (bssid_bytes) {
+                                const guint8 *bssid_data = g_bytes_get_data(bssid_bytes, NULL);
+                                NMEtherAddr bssid_addr;
+                                memcpy(&bssid_addr, bssid_data, ETH_ALEN);
+                                NMEtherAddr *new_ap_bssid = nm_wifi_ap_get_bssid(new_ap);
+                                if (new_ap_bssid && !nm_ether_addr_equal(&bssid_addr, new_ap_bssid)) {
+                                    _LOGD(LOGD_WIFI, "Ignoring roam to %s because connection is restricted to %s",
+                                          nm_ether_addr_to_string(new_ap_bssid),
+                                          nm_ether_addr_to_string(&bssid_addr));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 priv->roam_supplicant_wait_source =
                     nm_g_timeout_add_source(10000, roam_supplicant_wait_timeout, self);
             }

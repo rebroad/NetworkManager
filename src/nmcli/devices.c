@@ -3988,12 +3988,34 @@ do_device_wifi_connect(const NMCCommand *cmd, NmCli *nmc, int argc, const char *
     for (i = 0; i < avail_cons->len; i++) {
         NMConnection *avail_con = g_ptr_array_index(avail_cons, i);
         const char   *id        = nm_connection_get_id(NM_CONNECTION(avail_con));
+        NMSettingWireless *s_wifi_avail = nm_connection_get_setting_wireless(avail_con);
+        const char *avail_bssid = s_wifi_avail ? nm_setting_wireless_get_bssid(s_wifi_avail) : NULL;
 
         if (con_name) {
             if (!id || strcmp(id, con_name))
                 continue;
 
             name_match = TRUE;
+        }
+
+        /* If user specified a bssid, check that the available connection either has no bssid (unlocked)
+         * or has the same bssid as specified. However, if the available connection has no bssid,
+         * we should not use it because it would allow NetworkManager to select a different BSSID.
+         * So only use the available connection if it has the same bssid as the one specified.
+         */
+        if (bssid2_arr) {
+            if (!avail_bssid) {
+                /* Available connection has no bssid - skip it because we want to lock to the specified bssid */
+                continue;
+            }
+            /* Check if available connection's bssid matches the specified bssid */
+            guint8 avail_bssid_bin[ETH_ALEN];
+            if (nm_utils_hwaddr_aton(avail_bssid, avail_bssid_bin, ETH_ALEN)) {
+                if (memcmp(avail_bssid_bin, bssid2_arr->data, ETH_ALEN) != 0) {
+                    /* BSSIDs don't match - skip */
+                    continue;
+                }
+            }
         }
 
         if (nm_access_point_connection_valid(ap, NM_CONNECTION(avail_con))) {

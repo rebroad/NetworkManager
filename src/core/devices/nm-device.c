@@ -17675,8 +17675,13 @@ _set_state_full(NMDevice *self, NMDeviceState state, NMDeviceStateReason reason,
             _dev_addrgenmode6_set(self, NM_IN6_ADDR_GEN_MODE_NONE);
             if (priv->managed_type == NM_DEVICE_MANAGED_TYPE_REMOVED) {
                 nm_device_cleanup(self, reason, CLEANUP_TYPE_REMOVED);
-            } else
+            } else if (reason == NM_DEVICE_STATE_REASON_NEW_ACTIVATION) {
+                /* When switching BSSIDs, preserve DHCP lease to reduce downtime */
+                _cleanup_ip_pre(self, AF_INET, CLEANUP_TYPE_KEEP_REAPPLY, TRUE);
+                _cleanup_ip_pre(self, AF_INET6, CLEANUP_TYPE_KEEP_REAPPLY, TRUE);
+            } else {
                 nm_device_cleanup(self, reason, CLEANUP_TYPE_DECONFIGURE);
+            }
 
         } else if (old_state < NM_DEVICE_STATE_DISCONNECTED) {
             if (priv->managed_type == NM_DEVICE_MANAGED_TYPE_FULL) {

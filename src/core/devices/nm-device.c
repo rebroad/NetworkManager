@@ -259,6 +259,7 @@ typedef struct {
     NMDhcpConfig   *config;
     gulong          notify_sigid;
     NMDeviceIPState state;
+    bool            roam_revalidate_keep : 1;
     union {
         struct {
         } v4;
@@ -7332,6 +7333,28 @@ nm_device_update_dynamic_ip_setup(NMDevice *self, const char *reason)
     }
 }
 
+void
+nm_device_update_dynamic_ip_setup_on_roam(NMDevice *self, const char *reason)
+{
+    NMDevicePrivate *priv;
+
+    g_return_if_fail(NM_IS_DEVICE(self));
+
+    priv = NM_DEVICE_GET_PRIVATE(self);
+
+    /* We want to keep the currently configured DHCP-derived L3 config active
+     * while attempting to validate/renew it in the background. In particular,
+     * do not fail the device just because the DHCP (re)start doesn't quickly
+     * get a response while we still have a usable lease applied.
+     *
+     * If the DHCP server NAKs us, the DHCP client will drop the lease (LEASE_UPDATE
+     * with NULL l3cd) and fall back to a full reconfigure. */
+    priv->ipdhcp_data_4.roam_revalidate_keep = TRUE;
+    priv->ipdhcp_data_6.roam_revalidate_keep = TRUE;
+
+    nm_device_update_dynamic_ip_setup(self, reason);
+}
+
 /*****************************************************************************/
 
 static void
@@ -11609,22 +11632,31 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
         return;
 
     case NM_DHCP_CLIENT_NOTIFY_TYPE_NO_LEASE_TIMEOUT:
-        /* Here we also fail if we had a lease and it expired. Maybe,
-         * ipv[46].dhcp-timeout should only cover the time until we get
-         * a lease for the first time. How it is here, it means that a
-         * connection can fail after being connected successfully for a
-         * longer time. */
+        if (priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep
+            && priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(IS_IPv4)].d) {
+            /* We are validating/renewing after roaming. Keep the existing
+             * DHCP-derived configuration active and keep trying in the background. */
+            _LOGD_ipdhcp(addr_family,
+                         "roam: DHCP timed out but keeping existing lease/config and continuing");
+            return;
+        }
         _dev_ipdhcpx_handle_fail(self, addr_family, "timeout getting lease");
         return;
 
     case NM_DHCP_CLIENT_NOTIFY_TYPE_IT_LOOKS_BAD:
-        /* Like NM_DHCP_CLIENT_NOTIFY_TYPE_NO_LEASE_TIMEOUT, this does not
-         * apply only if we never got a lease, but also after being fully
-         * connected. We can also fail then. */
+        if (priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep
+            && priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(IS_IPv4)].d) {
+            _LOGD_ipdhcp(addr_family,
+                         "roam: DHCP looks bad (%s) but keeping existing lease/config and continuing",
+                         notify_data->it_looks_bad.reason ?: "unknown");
+            return;
+        }
         _dev_ipdhcpx_handle_fail(self, addr_family, notify_data->it_looks_bad.reason);
         return;
 
     case NM_DHCP_CLIENT_NOTIFY_TYPE_LEASE_UPDATE:
+    {
+        gboolean config_changed = TRUE;
 
         if (!notify_data->lease_update.l3cd) {
             const NML3ConfigData *dhcp_l3cd = priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(IS_IPv4)].d;
@@ -11647,6 +11679,35 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
         else
             _LOGT_ipdhcp(addr_family, "lease update");
 
+        /* When we validate/renew after roaming we want to avoid churn when the
+         * effective L3 configuration stays the same (e.g. only lease times changed). */
+        if (notify_data->lease_update.accepted) {
+            const NML3ConfigData *old_l3cd = priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(IS_IPv4)].d;
+            const NML3ConfigData *new_l3cd = notify_data->lease_update.l3cd;
+
+            if (old_l3cd && new_l3cd) {
+                config_changed = (nm_l3_config_data_cmp_full(old_l3cd,
+                                                            new_l3cd,
+                                                            NM_L3_CONFIG_CMP_FLAGS_ADDRESSES_ID
+                                                                | NM_L3_CONFIG_CMP_FLAGS_ROUTES_ID
+                                                                | NM_L3_CONFIG_CMP_FLAGS_DNS)
+                                  != 0);
+                if (!config_changed) {
+                    if (nm_l3_config_data_get_mtu(old_l3cd) != nm_l3_config_data_get_mtu(new_l3cd))
+                        config_changed = TRUE;
+                    if (!IS_IPv4
+                        && nm_l3_config_data_get_ip6_mtu(old_l3cd)
+                               != nm_l3_config_data_get_ip6_mtu(new_l3cd))
+                        config_changed = TRUE;
+                    if (nm_l3_config_data_get_route_table_sync(old_l3cd, addr_family)
+                            != nm_l3_config_data_get_route_table_sync(new_l3cd, addr_family)
+                        || nm_l3_config_data_get_never_default(old_l3cd, addr_family)
+                               != nm_l3_config_data_get_never_default(new_l3cd, addr_family))
+                        config_changed = TRUE;
+                }
+            }
+        }
+
         nm_dhcp_config_set_lease(priv->ipdhcp_data_x[IS_IPv4].config,
                                  notify_data->lease_update.l3cd);
 
@@ -11659,7 +11720,7 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
                                             notify_data->lease_update.l3cd,
                                             FALSE);
 
-        if (notify_data->lease_update.accepted) {
+        if (notify_data->lease_update.accepted && config_changed) {
             nm_manager_write_device_state(priv->manager, self, NULL);
             nm_dispatcher_call_device(NM_DISPATCHER_ACTION_DHCP_CHANGE_X(IS_IPv4),
                                       self,
@@ -11671,11 +11732,21 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
                 _dev_ipdhcpx_set_state(self, addr_family, NM_DEVICE_IP_STATE_READY);
                 _dev_ip_state_check_async(self, addr_family);
             }
+        } else if (notify_data->lease_update.accepted) {
+            /* Ensure DHCP state reaches READY even if nothing changed. */
+            if (priv->ipdhcp_data_x[IS_IPv4].state != NM_DEVICE_IP_STATE_READY) {
+                _dev_ipdhcpx_set_state(self, addr_family, NM_DEVICE_IP_STATE_READY);
+                _dev_ip_state_check_async(self, addr_family);
+            }
         }
+
+        if (notify_data->lease_update.accepted)
+            priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep = FALSE;
 
 lease_update_out:
         nm_device_update_metered(self);
         return;
+    }
     }
 
     nm_assert_not_reached();

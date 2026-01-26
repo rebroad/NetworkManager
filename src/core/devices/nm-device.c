@@ -7342,6 +7342,19 @@ nm_device_update_dynamic_ip_setup_on_roam(NMDevice *self, const char *reason)
 
     priv = NM_DEVICE_GET_PRIVATE(self);
 
+    if (priv->ipdhcp_data_4.state != NM_DEVICE_IP_STATE_NONE) {
+        _LOGD_ipdhcp(AF_INET,
+                     "handoff: starting DHCP revalidation (keeping existing lease/config) (%s) (has_lease=%d)",
+                     reason ?: "no-reason",
+                     !!priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(TRUE)].d);
+    }
+    if (priv->ipdhcp_data_6.state != NM_DEVICE_IP_STATE_NONE) {
+        _LOGD_ipdhcp(AF_INET6,
+                     "handoff: starting DHCP revalidation (keeping existing lease/config) (%s) (has_lease=%d)",
+                     reason ?: "no-reason",
+                     !!priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(FALSE)].d);
+    }
+
     /* We want to keep the currently configured DHCP-derived L3 config active
      * while attempting to validate/renew it in the background. In particular,
      * do not fail the device just because the DHCP (re)start doesn't quickly
@@ -11637,7 +11650,7 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
             /* We are validating/renewing after roaming. Keep the existing
              * DHCP-derived configuration active and keep trying in the background. */
             _LOGD_ipdhcp(addr_family,
-                         "roam: DHCP timed out but keeping existing lease/config and continuing");
+                         "handoff: DHCP timed out but keeping existing lease/config and continuing");
             return;
         }
         _dev_ipdhcpx_handle_fail(self, addr_family, "timeout getting lease");
@@ -11647,7 +11660,7 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
         if (priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep
             && priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(IS_IPv4)].d) {
             _LOGD_ipdhcp(addr_family,
-                         "roam: DHCP looks bad (%s) but keeping existing lease/config and continuing",
+                         "handoff: DHCP looks bad (%s) but keeping existing lease/config and continuing",
                          notify_data->it_looks_bad.reason ?: "unknown");
             return;
         }
@@ -11662,6 +11675,10 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
             const NML3ConfigData *dhcp_l3cd = priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(IS_IPv4)].d;
 
             _LOGT_ipdhcp(addr_family, "lease lost");
+            if (priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep && dhcp_l3cd) {
+                _LOGD_ipdhcp(addr_family,
+                             "handoff: DHCP lease lost during revalidation; falling back to full DHCP reconfigure");
+            }
             _dev_ipdhcpx_set_state(self, addr_family, NM_DEVICE_IP_STATE_PENDING);
             _dev_ip_state_check_async(self, addr_family);
             if (dhcp_l3cd
@@ -11721,6 +11738,10 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
                                             FALSE);
 
         if (notify_data->lease_update.accepted && config_changed) {
+            if (priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep) {
+                _LOGD_ipdhcp(addr_family,
+                             "handoff: DHCP revalidation succeeded; effective config changed (dispatch dhcp-change)");
+            }
             nm_manager_write_device_state(priv->manager, self, NULL);
             nm_dispatcher_call_device(NM_DISPATCHER_ACTION_DHCP_CHANGE_X(IS_IPv4),
                                       self,
@@ -11733,6 +11754,10 @@ _dev_ipdhcpx_notify(NMDhcpClient *client, const NMDhcpClientNotifyData *notify_d
                 _dev_ip_state_check_async(self, addr_family);
             }
         } else if (notify_data->lease_update.accepted) {
+            if (priv->ipdhcp_data_x[IS_IPv4].roam_revalidate_keep) {
+                _LOGD_ipdhcp(addr_family,
+                             "handoff: DHCP revalidation succeeded; effective config unchanged (skipping dhcp-change)");
+            }
             /* Ensure DHCP state reaches READY even if nothing changed. */
             if (priv->ipdhcp_data_x[IS_IPv4].state != NM_DEVICE_IP_STATE_READY) {
                 _dev_ipdhcpx_set_state(self, addr_family, NM_DEVICE_IP_STATE_READY);
@@ -15312,6 +15337,25 @@ nm_device_queue_activation(NMDevice *self, NMActRequest *req)
 
     /* Deactivate existing activation request first */
     if (priv->act_request.obj) {
+        /* When switching Wi-Fi connections (SSID change / "new activation request"),
+         * keep the existing DHCP-derived L3 config active as long as possible and
+         * revalidate it after the new association completes.
+         *
+         * This does not make the 802.11 re-association itself faster; it only
+         * avoids unnecessary DHCP/L3 churn. */
+        if (nm_device_get_device_type(self) == NM_DEVICE_TYPE_WIFI) {
+            if (priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(TRUE)].d) {
+                priv->ipdhcp_data_4.roam_revalidate_keep = TRUE;
+                _LOGD_ipdhcp(AF_INET,
+                             "handoff: new activation requested; keeping existing lease/config during transition");
+            }
+            if (priv->l3cds[L3_CONFIG_DATA_TYPE_DHCP_X(FALSE)].d) {
+                priv->ipdhcp_data_6.roam_revalidate_keep = TRUE;
+                _LOGD_ipdhcp(AF_INET6,
+                             "handoff: new activation requested; keeping existing lease/config during transition");
+            }
+        }
+
         _LOGI(LOGD_DEVICE, "disconnecting for new activation request.");
         nm_device_state_changed(self,
                                 NM_DEVICE_STATE_DEACTIVATING,
@@ -17747,7 +17791,7 @@ _set_state_full(NMDevice *self, NMDeviceState state, NMDeviceStateReason reason,
             if (priv->managed_type == NM_DEVICE_MANAGED_TYPE_REMOVED) {
                 nm_device_cleanup(self, reason, CLEANUP_TYPE_REMOVED);
             } else if (reason == NM_DEVICE_STATE_REASON_NEW_ACTIVATION) {
-                /* When switching BSSIDs, preserve DHCP lease to reduce downtime */
+                /* When switching connections, preserve DHCP lease to reduce downtime */
                 _cleanup_ip_pre(self, AF_INET, CLEANUP_TYPE_KEEP_REAPPLY, TRUE);
                 _cleanup_ip_pre(self, AF_INET6, CLEANUP_TYPE_KEEP_REAPPLY, TRUE);
             } else {
